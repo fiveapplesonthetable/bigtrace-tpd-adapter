@@ -1,0 +1,670 @@
+/*
+ * Copyright (C) 2026 The tpd Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package tpd;
+
+message ClientMsg {
+  uint64 request_id = 1;
+  oneof req {
+    RunQueryRequest run_query = 2;
+    CancelQueryRequest cancel = 3;
+    GetStatsRequest get_stats = 4;
+    ListTracesRequest list_traces = 5;
+    UpdateConfigRequest update_config = 6;
+    GetConfigRequest get_config = 7;
+    PingRequest ping = 8;
+    InspectTraceRequest inspect_trace = 9;
+    ListDirFilesRequest list_dir_files = 10;
+    RescanDirRequest rescan_dir = 11;
+    EvictTraceRequest evict_trace = 12;
+    KillTraceRequest kill_trace = 13;
+    ListEventsRequest list_events = 14;
+    QueueDumpRequest queue_dump = 15;
+    ResetSessionRequest reset_session = 16;
+    SessionInfoRequest session_info = 17;
+    InflightRequest inflight = 18;
+    PersistSqlRequest persist_sql = 19;
+    SqlOnPersistDbRequest sql_on_persist_db = 20;
+    ListPersistedRequest list_persisted = 21;
+    DropPersistedRequest drop_persisted = 22;
+    MallocOpRequest malloc_op = 23;
+    CraRegistryRequest cra_registry = 24;
+    ShutdownRequest shutdown = 25;
+  }
+}
+
+message ServerMsg {
+  uint64 request_id = 1;
+  oneof resp {
+    RunQueryResponse run_query = 2;
+    CancelQueryResponse cancel = 3;
+    GetStatsResponse get_stats = 4;
+    ListTracesResponse list_traces = 5;
+    UpdateConfigResponse update_config = 6;
+    GetConfigResponse get_config = 7;
+    PingResponse ping = 8;
+    InspectTraceResponse inspect_trace = 9;
+    ListDirFilesResponse list_dir_files = 10;
+    RescanDirResponse rescan_dir = 11;
+    EvictTraceResponse evict_trace = 12;
+    KillTraceResponse kill_trace = 13;
+    ListEventsResponse list_events = 14;
+    QueueDumpResponse queue_dump = 15;
+    ResetSessionResponse reset_session = 16;
+    SessionInfoResponse session_info = 17;
+    InflightResponse inflight = 18;
+    PersistSqlResponse persist_sql = 19;
+    SqlOnPersistDbResponse sql_on_persist_db = 20;
+    ListPersistedResponse list_persisted = 21;
+    DropPersistedResponse drop_persisted = 22;
+    MallocOpResponse malloc_op = 23;
+    CraRegistryResponse cra_registry = 24;
+    ShutdownResponse shutdown = 25;
+    ErrorResponse error = 99;
+  }
+}
+
+message ErrorResponse {
+  int32 code = 1;       // matches absl::StatusCode int values
+  string message = 2;
+}
+
+message RunQueryRequest {
+  string sql = 1;
+  // Glob patterns (applied to trace path basename). Empty = all traces.
+  repeated string trace_filter_globs = 2;
+  // The output fd is passed via SCM_RIGHTS in the same sendmsg; not in the proto.
+
+  // Tags 3-4 were the legacy per-TP persist fields. Removed in v0.4;
+  // use the dedicated `persist_sql` RPC instead (`tpd_cli persist`).
+  reserved 3, 4;
+  reserved "persist_table_name", "persist_auto";
+
+  // Optional cap on cumulative rows across every per-trace dispatch.
+  // 0 = no cap. Once hit, the server stops emitting chunks AND skips
+  // popping any tasks for this query that haven't started yet. The
+  // completion envelope reports the skipped tail as truncated, but
+  // does not wait for one no-op footer per trace.
+  uint64 max_rows = 5;
+
+  // Optional state filter. Restricts the query fan-out by current
+  // load state, so a query against an old trace doesn't pay
+  // Cold→Hot parse latency.
+  //
+  //   STATE_FILTER_ANY    (default): match every registered trace.
+  //   STATE_FILTER_LOADED: only Hot or Warm — the trace is already
+  //                        spawned, so no Empty/Cold acquisition is admitted.
+  //                        Warm traces can still finish initialization before
+  //                        the query runs.
+  //   STATE_FILTER_HOT:    only currently-Hot — strictly zero
+  //                        restore cost; queries land on already-
+  //                        resident heap.
+  enum StateFilter {
+    STATE_FILTER_ANY    = 0;
+    STATE_FILTER_LOADED = 1;
+    STATE_FILTER_HOT    = 2;
+  }
+  StateFilter state_filter = 6;
+
+  // Optional cap on the number of traces admitted to this fan-out after
+  // filters and acquire-cost ordering. 0 = no cap. Useful with
+  // STATE_FILTER_HOT for quick interactive sampling without waking Cold traces.
+  uint64 max_traces = 7;
+}
+
+message RunQueryResponse {
+  uint64 query_id = 1;
+  uint32 num_traces_dispatched = 2;
+  // Session this query was admitted into. The client can compare across
+  // calls to detect a server-side reset (someone else issued
+  // ResetSession in between).
+  string session_uuid = 3;
+}
+
+message CancelQueryRequest {
+  uint64 query_id = 1;
+  // v0.12: also force-kill any TP currently running a per-trace task
+  // for this qid. Default off — soft cancel waits for the running TP
+  // chunk to finish (typically <100ms). Setting this to true sends
+  // SIGKILL to those TPs so an in-progress, runaway query gives back
+  // its slot immediately. Cost: those TPs go Cold and the next query
+  // pays a Cold→Hot reload.
+  bool kill_tps = 2;
+}
+message CancelQueryResponse {
+  bool cancelled = 1;
+  int32 tps_killed = 2;       // count of TPs SIGKILL'd (when kill_tps=true)
+  int32 pending_skipped = 3;  // pending tasks for this qid the dispatcher will fast-skip
+}
+
+message GetStatsRequest {}
+
+message GetStatsResponse {
+  // Aggregates.
+  int64 resident_bytes = 1;
+  int64 arena_bytes = 2;
+  int64 server_rss_bytes = 3;       // /proc/self/status VmRSS
+  int64 server_vsz_bytes = 4;       // /proc/self/status VmSize
+  int32 alive_count = 5;
+  int32 hot_count = 6;
+  int32 warm_count = 7;             // formerly cool_count
+  int32 cold_count = 8;             // formerly gone_count
+
+  // Live config snapshot.
+  int64 memory_budget_bytes = 9;
+  int64 disk_budget_bytes = 10;
+  int32 alive_cap = 11;
+  int32 cpu_workers = 12;
+  reserved 13;                      // was: mode (batch|interactive)
+
+  // Counters since startup.
+  int64 queries_submitted = 14;
+  int64 queries_completed = 15;
+  int64 queries_failed = 16;
+  int64 evictions = 17;             // Hot -> Warm transitions
+  int64 unexpected_exits = 18;      // child exited outside normal ToCold path
+  int64 spawns = 19;
+  int64 page_faults_handled = 20;
+  int64 fault_resolve_total_ns = 21; // sum (for avg)
+
+  int64 uptime_seconds = 22;
+  int64 traces_known = 23;
+
+  // New live-config fields.
+  int32 per_trace_mb = 24;
+  int32 per_trace_load_timeout_ms = 25;
+  int64 logs_budget_bytes = 26;
+  int32 dir_poll_interval_ms = 27;
+  int32 logs_retain_hours = 36;
+  // New monitor counters.
+  reserved 28;                      // was: rewarms (eager re-warm removed)
+  int64 crashes_detected = 29;
+  int64 logs_rotated_files = 30;
+  // Event log stats.
+  int64 events_total = 31;
+  int64 events_buffered = 32;
+
+  // Aggregate per-TP RSS/PSS — for the "what's saved by sharing" story.
+  int64 tp_binary_bytes = 33;       // file size of configured tp-binary
+  int64 sum_proc_pss_bytes = 34;    // sum across alive TPs of /proc PSS
+  int64 sum_proc_rss_bytes = 35;    // sum across alive TPs of /proc RSS
+  // sum_proc_rss_bytes - sum_proc_pss_bytes ≈ shared bytes saved by mmap
+  // dedup of the trace_processor binary across TPs.
+
+  // Aggregate ArenaFile::Stats across alive TPs — for the compression
+  // ratio + latency story.
+  string arena_compress_algo = 37;        // "none" | "zstd" | "lz4"
+  int64 arena_bytes_uncompressed = 38;    // sum of input bytes ever written
+  int64 arena_compress_ns_total = 39;
+  int64 arena_decompress_ns_total = 40;
+  int64 arena_writes = 41;
+  int64 arena_reads = 42;
+
+  // Process-allocator stats. Populated only when tpd is linked against an
+  // introspectable allocator (jemalloc via TPD_MALLOC=jemalloc); empty under
+  // tcmalloc/system. The five counters below come from jemalloc's mallctl():
+  //   stats.allocated  bytes the app actually requested and is using
+  //   stats.active     bytes in active runs (may exceed allocated)
+  //   stats.metadata   bookkeeping overhead
+  //   stats.resident   bytes physically resident (matches RssAnon-ish)
+  //   stats.mapped     bytes mmap'd (virtual)
+  // Useful to spot fragmentation: resident much greater than allocated means
+  // dirty unused pages held by the allocator.
+  string allocator = 43;             // "jemalloc" | "tcmalloc" | "system"
+  string allocator_version = 44;     // e.g. "5.3.0-0-g..."
+  string allocator_conf = 45;        // MALLOC_CONF (jemalloc) or "" otherwise
+  int64 alloc_allocated_bytes = 46;
+  int64 alloc_active_bytes = 47;
+  int64 alloc_metadata_bytes = 48;
+  int64 alloc_resident_bytes = 49;
+  int64 alloc_mapped_bytes = 50;
+
+  reserved 51 to 66;
+
+  // v0.11 cgroup v2 budget enforcement. cgroup_enabled=false on hosts
+  // without cgroup-v2 delegation (then all the *_cgroup_* fields below
+  // are 0 / undefined). When enabled, the kernel enforces strict caps
+  // and these counters tell the operator what the kernel observed.
+  bool cgroup_enabled = 67;
+  int64 cgroup_memory_max_bytes = 68;     // kernel memory.max
+  int64 cgroup_memory_current_bytes = 69; // live tps/memory.current
+  int64 cgroup_memory_peak_bytes = 70;    // tps/memory.peak (high-watermark)
+  reserved 71;                            // was: memory.high events
+  int64 cgroup_oom_kill_events = 72;      // sum across trace cgroups
+  reserved 73, 74;                        // was: userspace freeze counters
+  reserved 75;                            // was: cgroup_budget_mode
+
+  // cra (Cold-from-Arena) counters + state. Mirrors the Warm-tier
+  // arena_* counters above: bytes captured/restored, calls, failures,
+  // total disk usage. Empty/zero when cra_mode_enabled is false.
+  bool   cra_enabled = 76;
+  int64  cra_capture_count = 77;
+  int64  cra_capture_fail_count = 78;
+  int64  cra_restore_count = 79;
+  int64  cra_restore_fail_count = 80;
+  int64  cra_store_bytes = 81;        // sum of <uuid>.cra file sizes
+  int32  cra_store_snapshots = 82;    // count of <uuid>.cra files
+  reserved 83;                        // was: cra_compress
+  reserved 84;                        // was: cra_restore_mode
+  int64 empty_to_hot_count = 85;       // source parses that reached Hot
+  int64 cold_to_hot_count = 86;        // init.cra restores that reached Hot
+  int64 cgroup_memory_anon_bytes = 87;   // memory.stat anon
+  int64 cgroup_memory_file_bytes = 88;   // memory.stat file (page cache)
+  int64 cgroup_memory_kernel_bytes = 89; // memory.stat kernel, if available
+  int64 cgroup_memory_slab_bytes = 90;   // memory.stat slab
+  int64 cgroup_memory_sock_bytes = 91;   // memory.stat sock
+  int64 cgroup_memory_shmem_bytes = 92;  // memory.stat shmem
+  int64 cra_snapshot_invalid_count = 93; // stale/corrupt snapshots erased
+  int64 daemon_memory_reserve_bytes = 94; // reserved/enforced for tpd_server
+  int64 tp_memory_budget_bytes = 95;      // effective tps/memory.max
+  string session_uuid = 96;               // current replay/query session
+  string profile = 97;                    // batch or interactive
+  int64 cgroup_swap_current_bytes = 98;    // tps/memory.swap.current
+  int64 cgroup_swap_max_bytes = 99;        // tps/memory.swap.max; -1 if max
+  string cra_compression = 100;            // "zstd" | "none"
+  string cra_capture = 101;                // "sparse" | "full"
+  string cra_restore = 119;                // "sparse" | "full"
+  string cra_restore_backend = 120;        // "auto" | "writev" | "mapfd"
+
+  // Counters since the last explicit `tpd_cli reset-session`
+  // command, or daemon start if no reset has happened. Existing unqualified
+  // counters above remain daemon-lifetime counters.
+  int64 queries_submitted_since_reset = 102;
+  int64 queries_completed_since_reset = 103;
+  int64 queries_failed_since_reset = 104;
+  int64 spawns_since_reset = 105;
+  int64 empty_to_hot_count_since_reset = 106;
+  int64 cold_to_hot_count_since_reset = 107;
+  int64 cra_capture_count_since_reset = 108;
+  int64 cra_capture_fail_count_since_reset = 109;
+  int64 cra_restore_count_since_reset = 110;
+  int64 cra_restore_fail_count_since_reset = 111;
+  int64 cra_snapshot_invalid_count_since_reset = 112;
+  int64 crashes_detected_since_reset = 113;
+  int64 unexpected_exits_since_reset = 114;
+  int64 cgroup_oom_kill_events_since_reset = 115;
+  int64 hot_timeout_count = 116;
+  int64 hot_timeout_count_since_reset = 117;
+  int64 evictions_since_reset = 118;
+}
+
+message ListTracesRequest {
+  string state_filter = 1;          // "" | "hot" | "warm" | "cold" | "empty" | "alive"
+  string glob = 2;                  // optional basename glob
+  bool with_proc = 3;               // include per-TP /proc stats
+}
+
+message TraceInfo {
+  string trace_uuid = 1;
+  string trace_path = 2;
+  string state = 3;                 // "Hot" | "Warm" | "Cold" | "Empty"
+  int32 pid = 4;                    // -1 if not alive
+  int32 http_port = 5;
+  int64 last_used_unix_ms = 6;
+  int64 resident_bytes = 7;
+  int64 arena_bytes = 8;
+  int64 vma_count = 9;
+
+  // /proc enrichments (only filled when with_proc=true).
+  int64 proc_rss_bytes = 10;
+  int64 proc_vsz_bytes = 11;
+  int64 proc_pss_bytes = 12;
+  int64 proc_anon_bytes = 13;
+
+  // Lock-free busy state — see TpHandle's active_queries_ /
+  // evicting_ atomics. `active_queries` is the number of dispatcher
+  // workers currently running a query on this TP; `evicting` is true
+  // while the pool is mid-kill (ToCold) on
+  // this handle. Useful for monitoring tools and LLMs deciding
+  // whether a `tpd_cli kill <uuid>` will preempt a running query.
+  int32 active_queries = 14;
+  bool evicting = 15;
+
+  reserved 16;
+}
+
+message ListTracesResponse {
+  repeated TraceInfo traces = 1;
+}
+
+message UpdateConfigRequest {
+  // All optional; only fields present on the wire are applied. Each change
+  // emits a `config_change` event into the EventLog (key, old, new).
+  optional int64 memory_budget_bytes = 1;
+  optional int64 disk_budget_bytes = 2;
+  optional int32 alive_cap = 3;
+  optional int32 cpu_workers = 4;
+  optional int32 per_trace_mb = 5;
+  optional int32 per_trace_load_timeout_ms = 6;
+  optional int64 logs_budget_bytes = 7;
+  reserved 8;                                  // was: result_cache_budget_bytes
+  optional int32 dir_poll_interval_ms = 9;
+  optional int32 logs_retain_hours = 10;
+}
+message UpdateConfigResponse {}
+
+message GetConfigRequest {}
+message GetConfigResponse {
+  string traces_dir = 1;
+  string session_dir = 2;
+  string listen_path = 3;
+  string tp_binary_path = 4;
+  int64 memory_budget_bytes = 5;
+  int64 disk_budget_bytes = 6;
+  int32 alive_cap = 7;
+  int32 cpu_workers = 8;
+  int32 http_port_base = 9;
+  reserved 10;                       // was: mode
+  int32 per_trace_mb = 11;
+  int32 per_trace_load_timeout_ms = 12;
+  int64 logs_budget_bytes = 13;
+  reserved 14;                       // was: result_cache_budget_bytes
+  int32 dir_poll_interval_ms = 15;
+  int32 logs_retain_hours = 16;
+  int64 daemon_memory_reserve_bytes = 17;
+  string profile = 18;
+  string cra_compression = 19;
+  string cra_capture = 20;              // "sparse" | "full"
+  string cra_restore = 21;              // "sparse" | "full"
+  string cra_restore_backend = 22;      // "auto" | "writev" | "mapfd"
+  string cra_manifest_path = 23;
+  string self_trace_path = 24;
+  int32 self_trace_flush_kb = 25;
+  string cra_snapshot_dir = 26;
+}
+
+message PingRequest {}
+message PingResponse {
+  int64 server_unix_nanos = 1;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {
+  bool accepted = 1;
+}
+
+message InspectTraceRequest {
+  // Either trace_uuid or trace_path. Unique substring of the path also OK.
+  string trace_uuid_or_path = 1;
+}
+message InspectTraceResponse {
+  TraceInfo info = 1;
+  // Per-VMA breakdown.
+  repeated VmaInfoProto vmas = 2;
+  // Recent activity.
+  int64 queries_handled = 3;
+  int64 evictions_count = 4;
+  int64 refaults_count = 5;
+  int64 last_query_unix_ms = 6;
+  int64 last_evict_unix_ms = 7;
+}
+message VmaInfoProto {
+  int64 start = 1;
+  int64 end = 2;
+  int32 vma_id = 3;
+  int64 resident_pages = 4;
+  int64 total_pages = 5;
+}
+
+message ListDirFilesRequest {
+  bool only_unmatched = 1;          // only files not yet picked up as traces
+}
+message DirFileInfo {
+  string path = 1;
+  string basename = 2;
+  int64 size_bytes = 3;
+  int64 mtime_unix_ms = 4;
+  bool matches_trace_pattern = 5;
+  bool registered_as_trace = 6;
+  string trace_uuid = 7;            // if registered
+}
+message ListDirFilesResponse {
+  string traces_dir = 1;
+  repeated DirFileInfo files = 2;
+  int64 total_bytes = 3;
+}
+
+message RescanDirRequest {}
+message RescanDirResponse {
+  int32 traces_added = 1;
+  int32 traces_removed = 2;
+  int32 traces_total = 3;
+}
+
+message CraRegistryRequest {
+  enum Op {
+    OP_LIST = 0;
+    OP_ADD_MANIFEST = 1;
+    OP_REMOVE_MANIFEST = 2;
+    OP_REMOVE_UUID = 3;
+  }
+  Op op = 1;
+  string manifest_path = 2;
+  string trace_uuid = 3;
+}
+
+message CraRegistryEntry {
+  string trace_uuid = 1;
+  string trace_name = 2;
+  string trace_path = 3;
+  string cra_file = 4;
+  string manifest_path = 5;
+}
+
+message CraRegistryResponse {
+  int32 traces_added = 1;
+  int32 traces_removed = 2;
+  int32 traces_total = 3;
+  repeated CraRegistryEntry entries = 4;
+}
+
+// Force a live trace to Cold (test/manual).
+message EvictTraceRequest { string trace_uuid_or_path = 1; }
+message EvictTraceResponse { int64 bytes_freed = 1; }
+
+// Force a kill -> Cold (test/manual).
+message KillTraceRequest { string trace_uuid_or_path = 1; }
+message KillTraceResponse { bool killed = 1; }
+
+message Event {
+  int64 ts_unix_ms = 1;
+  string kind = 2;        // see event_log.h KindStr() (e.g. "hot_to_cold")
+  string trace_uuid = 3;  // empty for non-trace events
+  string reason = 4;      // short tag, machine-friendly
+  string detail = 5;      // free-form
+  string session_uuid = 6; // empty for daemon/global events
+}
+
+message ListEventsRequest {
+  // 0 = all. Otherwise: only events with ts_unix_ms >= since_unix_ms.
+  int64 since_unix_ms = 1;
+  // Empty = all kinds. Otherwise only events where event.kind == kind.
+  string kind = 2;
+  // Empty = all traces.
+  string trace_uuid = 3;
+  // Cap on returned events. 0 = server default (1024).
+  int32 max = 4;
+  // Empty = all sessions.
+  string session_uuid = 5;
+}
+
+message ListEventsResponse {
+  // Newest first.
+  repeated Event events = 1;
+  // Total ever appended (may exceed events_buffered if ring rolled over).
+  int64 total_appended = 2;
+}
+
+message QueueDumpRequest {}
+
+message QueueRow {
+  uint64 query_id = 1;
+  string trace_uuid = 2;
+  string trace_path = 3;
+  string sql_first_chars = 4;
+  int64 age_ms = 5;
+}
+
+message QueueDumpResponse {
+  repeated QueueRow rows = 1;
+}
+
+message QueueClearRequest {}
+message QueueClearResponse {
+  int32 dropped = 1;
+}
+
+// In-flight per-query progress: qid + SQL prefix + per-trace
+// completion counts + bytes streamed + age. Cheap to call repeatedly
+// from a watch loop.
+message InflightRequest {}
+
+message InflightRow {
+  uint64 query_id = 1;
+  string sql_first_chars = 2;
+  int32 total_traces = 3;
+  int32 ok = 4;
+  int32 err = 5;
+  int32 in_flight = 6;
+  int64 bytes_streamed = 7;
+  int64 age_ms = 8;
+  string session_uuid = 9;
+}
+
+message InflightResponse {
+  repeated InflightRow rows = 1;
+}
+
+// Reset the server-wide session: drain in-flight queries, kill every
+// alive TP, clear every per-handle replay log, and mint a new session
+// uuid. Behaves as a queue barrier — no other task is processed while
+// the reset runs. Synchronous from the client's POV.
+message ResetSessionRequest {}
+message ResetSessionResponse {
+  string old_session_uuid = 1;
+  string new_session_uuid = 2;
+  int32 alive_killed = 3;        // Hot/Warm TPs forced to Cold
+  int32 handles_log_cleared = 4; // handles whose query log was non-empty
+}
+
+// Snapshot of the current session: server uuid + per-trace replay log
+// + per-trace timing aggregates. The aggregate
+// `total_replay_estimated_ns` is the sum of per-trace
+// session_query_ns_total — the upper-bound cost of full session
+// recovery if every TP died simultaneously.
+message SessionInfoRequest {
+  // Optional filter — empty means "every alive trace".
+  string trace_uuid = 1;
+  bool include_queries = 2;  // when true, fill SessionTrace.queries
+}
+
+message SessionTrace {
+  string trace_uuid = 1;
+  string trace_path = 2;
+  string state = 3;                  // "Hot" | "Warm" | "Cold" | "Empty"
+  int32 query_log_size = 4;          // entries in current session's log
+  int64 last_query_ns = 5;
+  int64 max_query_ns = 6;
+  int64 session_query_ns_total = 7;
+  int64 session_query_count = 8;
+  // If include_queries=true: each entry is a SQL string (in arrival
+  // order, with consecutive-duplicate dedup applied).
+  repeated string queries = 9;
+}
+
+message SessionInfoResponse {
+  string session_uuid = 1;
+  int64 session_resets_total = 2;
+  int64 total_replay_estimated_ns = 3;
+  repeated SessionTrace traces = 4;
+}
+
+// ---- persist.db RPCs --------------------------------------------------------
+//
+// Server-side persisted-results sqlite at <session_dir>/persist.db.
+// `persist_sql` runs `sql` across all matching traces, merges per-trace
+// results (with trace_uuid column appended), and stores the result as
+// a table in persist.db. `sql_on_persist_db` runs arbitrary SQL against
+// persist.db directly — no TP fan-out, no spawn cost. `list_persisted`
+// enumerates tables. `drop_persisted` drops a single named table.
+
+message PersistSqlRequest {
+  // Empty = auto-generate `tpd_qN` where N is a server-side sequence.
+  // Non-empty must match [A-Za-z_][A-Za-z0-9_]*.
+  string name = 1;
+  string sql = 2;
+  // Optional glob filters on trace path basename (same as run_query).
+  repeated string trace_filter_globs = 3;
+}
+message PersistSqlResponse {
+  // The actual table name used (echoes `name` if explicit, returns
+  // the auto-generated `tpd_qN` otherwise).
+  string name = 1;
+  int64  num_rows = 2;
+  int64  elapsed_ms = 3;
+  int32  num_traces_dispatched = 4;
+}
+
+message SqlOnPersistDbRequest {
+  string sql = 1;
+}
+message SqlRow {
+  // Cells stringified by sqlite (sqlite3_column_text). Empty string for NULL.
+  repeated string cells = 1;
+}
+message SqlOnPersistDbResponse {
+  repeated string column_names = 1;
+  repeated SqlRow rows = 2;
+}
+
+message ListPersistedRequest {}
+message PersistedTableInfo {
+  string name = 1;
+  int64  created_unix_ms = 2;
+  int64  num_rows = 3;
+  string source_sql = 4;
+}
+message ListPersistedResponse {
+  repeated PersistedTableInfo tables = 1;
+  string persist_db_path = 2;
+}
+
+message DropPersistedRequest {
+  string name = 1;
+}
+message DropPersistedResponse {
+  bool dropped = 1;
+}
+
+// Allocator runtime ops. Server-side dispatcher reads `op`, calls into
+// jemalloc's mallctl when linked with TPD_HAVE_JEMALLOC; otherwise returns
+// `supported=false` with an explanatory message.
+message MallocOpRequest {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_STATS = 1;       // verbose mallctl_stats_print() to text
+    OP_PURGE = 2;       // arena.MALLCTL_ARENAS_ALL.purge — release dirty pages
+  }
+  Op op = 1;
+}
+message MallocOpResponse {
+  bool supported = 1;     // false when allocator is system or tcmalloc
+  string allocator = 2;   // echoed for the CLI to render a useful message
+  string text = 3;        // for OP_STATS, the formatted dump
+  int64 dirty_bytes_purged = 4;  // for OP_PURGE, advisory (sum of resident drop)
+}

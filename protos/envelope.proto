@@ -1,0 +1,94 @@
+/*
+ * Copyright (C) 2026 The tpd Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package tpd;
+
+message ResultEnvelope {
+  uint64 query_id = 1;
+  string trace_uuid = 2;
+  string trace_path = 3;
+
+  oneof payload {
+    QueryResultChunk chunk = 4;
+    TraceFooter footer = 5;
+    QueryComplete complete = 6;
+  }
+}
+
+message QueryResultChunk {
+  // Raw bytes of one perfetto.protos.QueryResult message,
+  // forwarded verbatim from trace_processor_shell's HTTP response.
+  bytes raw_query_result = 1;
+}
+
+message TraceFooter {
+  enum Status {
+    STATUS_UNKNOWN = 0;
+    STATUS_OK = 1;
+    STATUS_ERROR = 2;
+    STATUS_CANCELLED = 3;
+    // STATUS_TRUNCATED: a clean partial result — the per-query
+    // --max-rows cap fired and we stopped emitting rows from this
+    // trace. NOT a failure, and not an explicit user cancel; the
+    // bytes already streamed are valid. Renders as "OK (truncated)"
+    // in tpd_cli; counted as OK for /inflight + /complete accounting.
+    STATUS_TRUNCATED = 4;
+  }
+  Status status = 1;
+  string error_message = 2;
+  // Total wall time from query enqueue to this trace's footer emit
+  // (queue wait + Acquire + HTTP query). Kept for compatibility.
+  int64 elapsed_ns = 3;
+  int64 chunks_sent = 4;
+  // Phase breakdown of `elapsed_ns`. Sum is `elapsed_ns`. Operators
+  // use these to diagnose long elapsed times: was the time in queue
+  // (other queries ahead), in Cold→Hot acquire (reparse / cra restore),
+  // or in the HTTP query itself? Without these, a 300s elapsed reads
+  // ambiguous; with these, it points at the bottleneck immediately.
+  //
+  // queue_ns          — task.enqueued_ns to RunOne entry.
+  // acquire_ns        — RunOne entry to first PostQuery byte (includes
+  //                     AcquireForQuery, TpHttpClient::Connect, request
+  //                     send).
+  // query_ns          — first PostQuery byte to last footer-emit byte
+  //                     (covers TP HTTP serialization + recv loop).
+  int64 queue_ns    = 7;
+  int64 acquire_ns  = 8;
+  int64 query_ns    = 9;
+  // State observed before acquire: "hot", "cold", or "empty".
+  // Successful query execution implies the destination is Hot.
+  string acquire_source = 10;
+  // trace_processor_shell pid used for this trace query, or -1 if the query
+  // failed before a TP child was acquired. This lets host Perfetto captures
+  // correlate tpd_cli footers with sched/process/io rows.
+  int32 tp_pid = 11;
+  // Tags 5-6 were the legacy per-TP persist fields (persist_row_count,
+  // persist_table_name). Removed in v0.4 — persisting now lives in the
+  // server-owned <session_dir>/persist.db (see PersistDb / `tpd_cli persist`).
+  reserved 5, 6;
+  reserved "persist_row_count", "persist_table_name";
+}
+
+message QueryComplete {
+  int32 traces_total = 1;
+  int32 traces_ok = 2;
+  int32 traces_error = 3;
+  int64 elapsed_ns = 4;
+  int32 traces_truncated = 5;
+  int32 traces_cancelled = 6;
+}

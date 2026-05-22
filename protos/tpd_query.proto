@@ -1,0 +1,124 @@
+/*
+ * Copyright (C) 2026 The tpd Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ */
+
+// Minimal subset of perfetto.protos.QueryArgs and QueryResult, copied
+// verbatim from upstream perfetto's trace_processor.proto. Used by the
+// tpd HTTP bridge (--http-port) to decode incoming /query requests
+// and merge per-trace QueryResults from multiple TPs into one
+// response. We intentionally re-namespace to `tpd` so the wire bytes
+// are identical to upstream but the C++ types don't collide if we
+// ever vendor more.
+//
+// Wire compat: field numbers MUST stay in sync with upstream. If
+// perfetto changes the schema, we update here.
+
+syntax = "proto2";
+
+package tpd;
+
+message TpdQueryArgs {
+  optional string sql_query = 1;
+  reserved 2;
+  optional string tag = 3;
+}
+
+// Mirror of perfetto.protos.StatusResult; the Perfetto UI POSTs to
+// /status before opening the WebSocket and expects this back. Field
+// numbers MUST match upstream — see
+// perfetto/protos/perfetto/trace_processor/trace_processor.proto.
+message TpdStatusResult {
+  optional string loaded_trace_name = 1;
+  optional string human_readable_version = 2;
+  optional int32 api_version = 3;
+  optional string version_code = 4;
+}
+
+// Wire-compatible subset of perfetto.protos.TraceProcessorRpc, used by
+// tpd's /websocket endpoint to serve the Perfetto UI. The UI sends
+// `TraceProcessorRpcStream` messages over a WebSocket; tpd parses
+// each varint-length-delimited TpdTraceProcessorRpc, dispatches the
+// `request` method, and emits a `response` (or `invalid_request`)
+// using the same envelope. Field numbers MUST stay in sync with
+// upstream.
+message TpdTraceProcessorRpc {
+  optional int64 seq = 1;
+  optional string fatal_error = 5;
+
+  enum Method {
+    TPM_UNSPECIFIED = 0;
+    TPM_APPEND_TRACE_DATA = 1;
+    TPM_FINALIZE_TRACE_DATA = 2;
+    TPM_QUERY_STREAMING = 3;
+    TPM_COMPUTE_METRIC = 5;
+    TPM_GET_METRIC_DESCRIPTORS = 6;
+    TPM_RESTORE_INITIAL_TABLES = 7;
+    TPM_ENABLE_METATRACE = 8;
+    TPM_DISABLE_AND_READ_METATRACE = 9;
+    TPM_GET_STATUS = 10;
+    TPM_RESET_TRACE_PROCESSOR = 11;
+    TPM_REGISTER_SQL_PACKAGE = 13;
+  }
+
+  // oneof type:
+  optional Method request         = 2;
+  optional Method response        = 3;
+  optional Method invalid_request = 4;
+
+  // oneof args:
+  // For TPM_QUERY_STREAMING request:  embed TpdQueryArgs.
+  optional TpdQueryArgs query_args = 103;
+  // For TPM_QUERY_STREAMING response: embed TpdQueryResult.
+  optional TpdQueryResult query_result = 203;
+  // For TPM_GET_STATUS response:      embed TpdStatusResult.
+  optional TpdStatusResult status = 210;
+}
+
+// Wire-compatible mirror of perfetto.protos.TraceProcessorRpcStream:
+// a packed sequence of TpdTraceProcessorRpc messages. The UI may
+// concatenate multiple RPCs in a single WebSocket frame, and tpd may
+// emit multiple response RPCs in a single frame. `repeated` semantics
+// give the right wire shape (each message is length-delimited).
+message TpdTraceProcessorRpcStream {
+  repeated TpdTraceProcessorRpc msg = 1;
+}
+
+message TpdQueryResult {
+  repeated string column_names = 1;
+  optional string error = 2;
+
+  message CellsBatch {
+    enum CellType {
+      CELL_INVALID = 0;
+      CELL_NULL = 1;
+      CELL_VARINT = 2;
+      CELL_FLOAT64 = 3;
+      CELL_STRING = 4;
+      CELL_BLOB = 5;
+    }
+    repeated CellType cells = 1 [packed = true];
+
+    repeated int64 varint_cells = 2 [packed = true];
+    repeated double float64_cells = 3 [packed = true];
+    repeated bytes blob_cells = 4;
+
+    // Concatenated NUL-terminated cell values.
+    optional string string_cells = 5;
+
+    optional bool is_last_batch = 6;
+
+    reserved 7;
+  }
+  repeated CellsBatch batch = 3;
+
+  optional uint32 statement_count = 4;
+  optional uint32 statement_with_output_count = 5;
+  optional string last_statement_sql = 6;
+  optional double elapsed_time_ms = 7;
+}
