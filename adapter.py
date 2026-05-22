@@ -307,10 +307,22 @@ class TpdClient:
             lt.state_filter = state_filter
         return list(self._round_trip(msg).list_traces.traces)
 
-    def run_query(self, sql, trace_glob, max_rows=0):
-        """Run `sql` on traces matching `trace_glob`.
+    # tpd RunQueryRequest.StateFilter values, keyed by the tpd_cli `--state`
+    # spellings (any|loaded|hot).
+    _STATE_FILTER = {
+        "any": control_pb2.RunQueryRequest.STATE_FILTER_ANY,
+        "loaded": control_pb2.RunQueryRequest.STATE_FILTER_LOADED,
+        "alive": control_pb2.RunQueryRequest.STATE_FILTER_LOADED,
+        "hot": control_pb2.RunQueryRequest.STATE_FILTER_HOT,
+    }
 
-        Returns a dict keyed by trace_uuid -> {path, status, error, chunks}.
+    def run_query(self, sql, trace_glob="", max_rows=0, globs=None,
+                  state_filter=None, max_traces=0):
+        """Run `sql` against tpd, mirroring `tpd_cli query` knobs.
+
+        `globs` (list) or `trace_glob` (single) -> trace_filter_globs;
+        `state_filter` in {any,loaded,hot}; `max_rows`/`max_traces` cap the
+        fan-out. Returns a dict keyed by trace_uuid -> {path,status,error,chunks}.
         """
         s = self._connect()
         r_fd, w_fd = os.pipe()
@@ -318,10 +330,15 @@ class TpdClient:
             msg = control_pb2.ClientMsg()
             rq = msg.run_query
             rq.sql = sql
-            if trace_glob:
-                rq.trace_filter_globs.append(trace_glob)
+            for g in (globs if globs else ([trace_glob] if trace_glob else [])):
+                if g:
+                    rq.trace_filter_globs.append(g)
             if max_rows:
                 rq.max_rows = max_rows
+            if max_traces:
+                rq.max_traces = max_traces
+            if state_filter and state_filter in self._STATE_FILTER:
+                rq.state_filter = self._STATE_FILTER[state_filter]
             _sendmsg_with_fd(s, msg.SerializeToString(), w_fd)
             os.close(w_fd)  # tpd holds its own copy now
             w_fd = -1
@@ -448,7 +465,7 @@ def query_one_trace(client, addr, sql, max_rows):
     return out
 
 
-def execute_bigtrace_query(client, sql, limit):
+def execute_bigtrace_query(client, sql, limit, opts=None):
     """Run `sql` across every trace tpd knows and merge into one flat table.
 
     This is what the Bigtrace UI's /execute_bigtrace_query wants: a single
@@ -459,9 +476,20 @@ def execute_bigtrace_query(client, sql, limit):
 
     Returns (column_names, rows, errors): rows is a list of value-lists,
     errors is a list of (trace, message) for traces that failed.
+
+    `opts` (from the UI's settings) maps to tpd_cli query flags:
+      traces (list of basename globs) -> trace_filter_globs (empty = all),
+      state_filter in {any,loaded,hot}, max_traces -> fan-out cap.
+    `limit` caps total merged rows AND is passed to tpd as max_rows.
     """
-    # Empty glob => fan out across all registered traces.
-    _dispatched, results = client.run_query(sql, "", max_rows=0)
+    opts = opts or {}
+    _dispatched, results = client.run_query(
+        sql,
+        globs=opts.get("traces") or None,   # empty/None => all traces
+        max_rows=limit or 0,
+        state_filter=opts.get("state_filter"),
+        max_traces=opts.get("max_traces") or 0,
+    )
     column_names = None
     merged = []
     errors = []
@@ -527,8 +555,15 @@ class ExecStore:
 
 
 def _raw_exec(ex):
-    """RawQueryExecution view (drops the internal _columns/_rows)."""
-    return {k: v for k, v in ex.items() if not k.startswith("_")}
+    """RawQueryExecution view (drops internal _columns/_rows and nulls).
+
+    Null fields must be omitted, not sent as JSON null: the main UI's
+    queryStore.mergeInto does `patch.error.length` and a null `error` throws
+    "Cannot read properties of null". Absent => undefined => its `?? `
+    fallbacks handle it.
+    """
+    return {k: v for k, v in ex.items()
+            if not k.startswith("_") and v is not None}
 
 
 def make_execution(sql, columns, rows, errors, materialized):
@@ -550,6 +585,84 @@ def make_execution(sql, columns, rows, errors, materialized):
         "_columns": columns,
         "_rows": rows,
     }
+
+
+# ---- Bigtrace settings <-> tpd query knobs --------------------------------
+#
+# The Bigtrace settings page is populated from /bigtrace_execution_config
+# (query options) and /trace_metadata_settings (trace selector). The chosen
+# values come back as settings:[{setting_id,values,category}] on every
+# /execute_bigtrace_query and map 1:1 to `tpd_cli query` flags, so the UI's
+# Settings page configures how tpd runs the query.
+
+
+def exec_config_settings():
+    """Backend execution settings -> the Settings page (BIGTRACE_QUERY_OPTIONS)."""
+    return [
+        {
+            "id": "tpd_state_filter",
+            "name": "State filter (tpd --state)",
+            "description": "Which load state a trace must be in to be queried. "
+                           "'hot' = zero restore cost; 'loaded' = Hot or Warm; "
+                           "'any' = also parse Cold/Empty on demand.",
+            "category": "BIGTRACE_QUERY_OPTIONS",
+            "stringEnum": {
+                "defaultValue": "any",
+                "options": [
+                    {"value": "any", "label": "any"},
+                    {"value": "loaded", "label": "loaded (hot or warm)"},
+                    {"value": "hot", "label": "hot only"},
+                ],
+            },
+        },
+        {
+            "id": "tpd_max_traces",
+            "name": "Max traces (tpd --max-traces)",
+            "description": "Cap how many traces this query fans out to "
+                           "(0 = no cap).",
+            "category": "BIGTRACE_QUERY_OPTIONS",
+            "number": {"defaultValue": 0, "min": 0, "max": 0},
+        },
+    ]
+
+
+def trace_metadata_settings(client):
+    """Trace selector -> the Settings page (TRACE_ADDRESS), live from tpd."""
+    try:
+        traces = client.list_traces()
+    except TpdError:
+        traces = []
+    names = sorted({os.path.basename(t.trace_path)
+                    for t in traces if t.trace_path})
+    return [{
+        "id": "tpd_traces",
+        "name": "Traces (tpd trace filter)",
+        "description": "Restrict the query to these traces (none selected = "
+                       "every trace tpd knows). Maps to trace_filter_globs.",
+        "category": "TRACE_ADDRESS",
+        "multiSelect": {
+            "defaultValues": [],
+            "options": [{"value": n, "label": n} for n in names],
+        },
+    }]
+
+
+def parse_settings(settings):
+    """settings:[{setting_id,values,category}] -> opts dict for run_query."""
+    opts = {}
+    for s in settings or []:
+        sid = s.get("setting_id") or s.get("settingId")
+        vals = s.get("values") or []
+        if sid == "tpd_state_filter" and vals:
+            opts["state_filter"] = vals[0]
+        elif sid == "tpd_max_traces" and vals:
+            try:
+                opts["max_traces"] = int(float(vals[0]))
+            except (ValueError, TypeError):
+                pass
+        elif sid == "tpd_traces" and vals:
+            opts["traces"] = [v for v in vals if v]
+    return opts
 
 
 # MIME types for the static UI assets.
@@ -710,11 +823,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/execute_bigtrace_query_async":
                 return self._handle_execute(materialized=True)
             if path == "/bigtrace_execution_config":
-                # No server-side execution filters to advertise.
-                return self._send_json(200, {"setting": []})
+                # tpd query options shown on the Settings page.
+                return self._send_json(200, {"setting": exec_config_settings()})
             if path == "/trace_metadata_settings":
-                # No metadata-derived filters either.
-                return self._send_json(200, {"setting": []})
+                # Live trace selector for the Settings page.
+                return self._send_json(
+                    200, {"setting": trace_metadata_settings(self.client)})
             if path == "/query":
                 return self._handle_query()
             if path.startswith("/query_executions/") and path.endswith(":cancel"):
@@ -748,8 +862,10 @@ class Handler(BaseHTTPRequestHandler):
         if not sql or not isinstance(sql, str):
             return self._send_json(400, {"error": "field 'perfetto_sql' required"})
         limit = int(req.get("limit", 0) or 0)
+        opts = parse_settings(req.get("settings"))
         try:
-            columns, rows, errors = execute_bigtrace_query(self.client, sql, limit)
+            columns, rows, errors = execute_bigtrace_query(
+                self.client, sql, limit, opts)
         except TpdError as e:
             return self._send_json(400, {"detail": str(e)})
         if not rows and errors:

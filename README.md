@@ -41,13 +41,33 @@ one row per trace, routed UI → adapter → tpd.
 
 | UI request                          | adapter behaviour                                              |
 | ----------------------------------- | ------------------------------------------------------------- |
-| `POST /execute_bigtrace_query` `{limit, perfetto_sql, settings}` | run the SQL across every tpd trace, merge into one table, return `{columnNames, rows:[{values}]}` with a leading `_trace` provenance column |
-| `POST /bigtrace_execution_config`   | `{setting: []}` (no server-side execution filters)            |
-| `POST /trace_metadata_settings`     | `{setting: []}` (no metadata-derived filters)                 |
+| `POST /execute_bigtrace_query[_async]` `{limit, perfetto_sql, settings}` | run the SQL across the selected tpd traces, merge into one table, return `{queryUuid, columnNames, rows:[{values}]}` with a leading `_trace` provenance column |
+| `POST /bigtrace_execution_config`   | query-option settings (state filter, max traces)              |
+| `POST /trace_metadata_settings`     | live trace selector (the traces tpd currently knows)          |
+| `GET  /query_executions`            | history list (so the sidebar + sync status work)              |
+| `GET  /query_executions/{uuid}[:status]` / `:fetch_results` | execution status / paged results |
+| `POST /query_executions/{uuid}:cancel`, `DELETE /query_executions/{uuid}` | cancel / forget |
 | `GET  /<asset>`                     | static file from `--ui-dist` (bigtrace.html, bundle, css, …)  |
 
 CORS echoes the request `Origin` and sets `Access-Control-Allow-Credentials`
 (the UI fetches with `credentials:'include'`, which forbids a `*` origin).
+
+The newer (upstream/main) UI runs every query as a tracked *execution* and
+learns it reached `SUCCESS` via the `/query_executions` API, so the adapter
+implements that API over an in-memory store (it executes synchronously
+against tpd, then serves status/results from the stored result).
+
+### Configuring tpd from the Settings page
+
+The Settings page is populated from the two config endpoints, and the chosen
+values ride along on every query and map 1:1 to `tpd_cli query` flags:
+
+| Setting (Settings page)        | tpd query knob                         |
+| ------------------------------ | -------------------------------------- |
+| State filter                   | `--state` (any / loaded / hot)         |
+| Max traces                     | `--max-traces`                         |
+| Traces (multi-select)          | trace filter globs (empty = all)       |
+| Limit (query toolbar)          | `--max-rows`                           |
 
 ## Also: adapter-native + per-trace API
 
