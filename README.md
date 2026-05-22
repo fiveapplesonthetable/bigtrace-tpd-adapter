@@ -69,6 +69,17 @@ values ride along on every query and map 1:1 to `tpd_cli query` flags:
 | Traces (multi-select)          | trace filter globs (empty = all)       |
 | Limit (query toolbar)          | `--max-rows`                           |
 
+### Persistent queries → tpd persist.db
+
+Toggling **Persistent** on in the query toolbar materializes the result into
+tpd's `persist.db`: the adapter calls tpd `persist_sql` (the same thing
+`tpd_cli persist` does), stores it as a `bt_<uuid>` table, and the query
+shows in the **History → Persistent** tab. Re-opening it (or the grid
+paging) re-queries the persisted table via tpd `sql_on_persist_db` — no
+re-run against the traces. Deleting a persistent query from the UI drops its
+persist.db table. Persisted tables created out-of-band (e.g. `tpd_cli
+persist`) also appear in the Persistent tab.
+
 ## Also: adapter-native + per-trace API
 
 Independent of the UI, the adapter exposes a Bigtrace-shaped JSON API:

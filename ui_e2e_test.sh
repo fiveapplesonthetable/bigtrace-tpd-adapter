@@ -57,6 +57,8 @@ cp "$WORK/bigtrace_ui.png" "$here/bigtrace_ui.png" 2>/dev/null && \
   echo "== screenshot saved: $here/bigtrace_ui.png"
 cp "$WORK/bigtrace_settings.png" "$here/bigtrace_settings.png" 2>/dev/null && \
   echo "== screenshot saved: $here/bigtrace_settings.png"
+cp "$WORK/bigtrace_persist.png" "$here/bigtrace_persist.png" 2>/dev/null && \
+  echo "== screenshot saved: $here/bigtrace_persist.png"
 
 echo
 echo "BIGTRACE UI E2E PASSED"

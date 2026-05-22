@@ -84,6 +84,8 @@ try {
                   {waitUntil: 'load', timeout: 60000});
   await page.waitForSelector('.cm-content', {timeout: 30000});
   await page.click('.cm-content');
+  await page.keyboard.press('Control+A');
+  await page.keyboard.press('Delete');
   await page.keyboard.type(SQL);
   await page.keyboard.press('Control+Enter');
 
@@ -104,6 +106,56 @@ try {
   await page.screenshot({path: OUT + '/bigtrace_ui.png', fullPage: true});
   console.log('STEP query screenshot ->', OUT + '/bigtrace_ui.png');
   console.log('STEP datagrid rendered results:', rendered);
+
+  // PROOF 3: Persistent (materialized) flow -> tpd persist.db.
+  let persisted = [];
+  try {
+    await page.goto(BASE + '/bigtrace.html#!/query',
+                    {waitUntil: 'load', timeout: 60000});
+    await page.waitForSelector('.cm-content', {timeout: 30000});
+    // Flip the "Persistent" Switch on.
+    const flipped = await page.evaluate(() => {
+      for (const cb of document.querySelectorAll('input[type=checkbox]')) {
+        const ctx = (cb.closest('label')?.textContent ||
+                     cb.parentElement?.textContent || '');
+        if (ctx.includes('Persistent')) {
+          if (!cb.checked) cb.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    console.log('STEP toggled Persistent:', flipped);
+    await page.waitForTimeout(300);
+    await page.click('.cm-content');
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Delete');
+    await page.keyboard.type('select name, count(*) c from thread group by name');
+    await page.keyboard.press('Control+Enter');
+    await page.waitForTimeout(4000);
+    // Switch the History sidebar to the Persistent tab if present.
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll('*')) {
+        if (el.children.length === 0 && /Persistent \(\d+\)/.test(el.textContent || '')) {
+          el.click();
+          return;
+        }
+      }
+    });
+    await page.waitForTimeout(800);
+    await page.screenshot({path: OUT + '/bigtrace_persist.png', fullPage: true});
+    console.log('STEP persist screenshot ->', OUT + '/bigtrace_persist.png');
+    persisted = await page.evaluate(async () => {
+      const r = await fetch('/query_executions', {credentials: 'include'});
+      const j = await r.json();
+      return (j.queryExecutions || [])
+        .filter((e) => e.materialized)
+        .map((e) => ({uuid: e.queryUuid, table: e.tableName, rows: e.processedRows}));
+    });
+    console.log('PERSISTED_EXECS', JSON.stringify(persisted));
+  } catch (e) {
+    console.log('STEP persist flow failed:', String(e));
+  }
 
   // Settings page screenshot.
   try {

@@ -404,6 +404,39 @@ class TpdClient:
             os.close(r_fd)
             s.close()
 
+    # ---- persist.db (server-side materialized results) --------------------
+
+    def persist_sql(self, name, sql, globs=None):
+        """Run `sql` across traces and materialize the merged result as a
+        named table in tpd's persist.db. Returns the PersistSqlResponse."""
+        msg = control_pb2.ClientMsg()
+        p = msg.persist_sql
+        p.sql = sql
+        if name:
+            p.name = name
+        for g in globs or []:
+            if g:
+                p.trace_filter_globs.append(g)
+        return self._round_trip(msg).persist_sql
+
+    def sql_on_persist_db(self, sql):
+        """Run arbitrary SQL directly against persist.db (no TP fan-out).
+        Returns (column_names, rows) where rows is a list of cell-lists."""
+        msg = control_pb2.ClientMsg()
+        msg.sql_on_persist_db.sql = sql
+        resp = self._round_trip(msg).sql_on_persist_db
+        return list(resp.column_names), [list(r.cells) for r in resp.rows]
+
+    def list_persisted(self):
+        msg = control_pb2.ClientMsg()
+        msg.list_persisted.SetInParent()
+        return self._round_trip(msg).list_persisted
+
+    def drop_persisted(self, name):
+        msg = control_pb2.ClientMsg()
+        msg.drop_persisted.name = name
+        return self._round_trip(msg).drop_persisted
+
 
 # ---------------------------------------------------------------------------
 # Bigtrace-shaped HTTP front-end.
@@ -587,6 +620,42 @@ def make_execution(sql, columns, rows, errors, materialized):
     }
 
 
+def _ms_to_iso(ms):
+    return datetime.datetime.fromtimestamp(
+        ms / 1000.0, datetime.timezone.utc).isoformat()
+
+
+def _persist_table_name(uuid):
+    # tpd persist names must match [A-Za-z_][A-Za-z0-9_]*; the bt_ prefix keeps
+    # a uuid hex (which may start with a digit) valid.
+    return "bt_" + uuid
+
+
+def _persist_uuid_for_table(name):
+    # Stable uuid for a persisted table so it keeps the same execution id
+    # across adapter restarts.
+    return _uuid.uuid5(_uuid.NAMESPACE_OID, "persist:" + name).hex
+
+
+def make_materialized_execution(uuid, sql, table_name, num_rows, start_iso=None):
+    """A materialized (Persistent) execution. Rows live in tpd's persist.db
+    table `table_name` and are fetched on demand, not held here."""
+    now = _now_iso()
+    return {
+        "queryUuid": uuid,
+        "status": "SUCCESS",
+        "startTime": start_iso or now,
+        "endTime": now,
+        "processedRows": num_rows,
+        "processedTraces": 0,
+        "totalTraces": 0,
+        "perfettoSql": sql,
+        "limit": 0,
+        "materialized": True,
+        "tableName": table_name,
+    }
+
+
 # ---- Bigtrace settings <-> tpd query knobs --------------------------------
 #
 # The Bigtrace settings page is populated from /bigtrace_execution_config
@@ -750,12 +819,19 @@ class Handler(BaseHTTPRequestHandler):
         # Bigtrace UI query-executions API (GET): history list, status,
         # detail, fetch_results.
         if path == "/query_executions":
+            # Surface persisted (materialized) tables from tpd too, so the
+            # Persistent history tab shows them even across adapter restarts.
+            self._reconcile_persisted()
             return self._send_json(200, {
                 "queryExecutions": [_raw_exec(e) for e in self.execs.list_newest_first()]
             })
         if path.startswith("/query_executions/"):
             uuid, action = self._parse_exec_path(path)
             ex = self.execs.get(uuid)
+            if ex is None and action in ("", "status"):
+                # May be a persisted table we haven't reconciled yet.
+                self._reconcile_persisted()
+                ex = self.execs.get(uuid)
             if ex is None:
                 return self._send_json(404, {"detail": f"Query {uuid} not found"})
             if action == "fetch_results":
@@ -763,6 +839,19 @@ class Handler(BaseHTTPRequestHandler):
                                           if "?" in self.path else "")
                 limit = int((q.get("limit") or ["0"])[0] or 0)
                 offset = int((q.get("offset") or ["0"])[0] or 0)
+                if ex.get("materialized") and ex.get("tableName"):
+                    # Re-query the persisted table in tpd's persist.db.
+                    try:
+                        cols, rows = self._fetch_persisted(
+                            ex["tableName"], limit, offset)
+                    except TpdError as e:
+                        return self._send_json(400, {"detail": str(e)})
+                    return self._send_json(200, {
+                        "queryUuid": uuid,
+                        "columnNames": cols,
+                        "rows": [{"values": r} for r in rows],
+                        "totalFilteredRows": ex.get("processedRows", len(rows)),
+                    })
                 rows = ex["_rows"][offset:(offset + limit) if limit else None]
                 return self._send_json(200, {
                     "queryUuid": uuid,
@@ -845,17 +934,54 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.startswith("/query_executions/"):
             uuid, _ = self._parse_exec_path(path)
+            ex = self.execs.get(uuid)
+            # Forgetting a Persistent query drops its persist.db table too.
+            if ex and ex.get("materialized") and ex.get("tableName"):
+                try:
+                    self.client.drop_persisted(ex["tableName"])
+                except TpdError:
+                    pass
             self.execs.delete(uuid)
             return self._send_json(200, {})
         self._send_json(404, {"error": f"unknown path {path}"})
 
+    # ---- persist.db helpers ------------------------------------------------
+
+    def _fetch_persisted(self, table, limit, offset):
+        q = 'SELECT * FROM "%s"' % table.replace('"', '""')
+        if limit:
+            q += " LIMIT %d OFFSET %d" % (int(limit), int(offset))
+        elif offset:
+            q += " LIMIT -1 OFFSET %d" % int(offset)
+        return self.client.sql_on_persist_db(q)
+
+    def _reconcile_persisted(self):
+        """Register tpd persist.db tables we don't already track as
+        materialized executions (so they show + re-fetch after a restart)."""
+        try:
+            lp = self.client.list_persisted()
+        except TpdError:
+            return
+        have = {e.get("tableName") for e in self.execs.list_newest_first()
+                if e.get("tableName")}
+        for t in lp.tables:
+            if t.name in have:
+                continue
+            uuid = _persist_uuid_for_table(t.name)
+            if self.execs.get(uuid) is not None:
+                continue
+            self.execs.put(make_materialized_execution(
+                uuid, t.source_sql, t.name, t.num_rows,
+                start_iso=_ms_to_iso(t.created_unix_ms) if t.created_unix_ms else None))
+
     def _handle_execute(self, materialized):
         """Bigtrace UI endpoint: {limit, perfetto_sql, settings} -> table.
 
-        Runs the query against tpd now, records the execution (so the
-        query-executions API can report it terminal + page results), and
-        returns the result page. `/execute_bigtrace_query_async` lands here
-        too — we execute synchronously, so the UI's poll sees SUCCESS at once.
+        Non-materialized (Persistent off): run synchronously against tpd, hold
+        the result in memory, return it. Materialized (Persistent on): persist
+        the merged result into tpd's persist.db via persist_sql (auto-persist),
+        then page rows back from there on demand — so the Persistent history
+        item re-queries the persisted table when you re-open/fetch it.
         """
         req = self._read_json_body()
         sql = req.get("perfetto_sql") or req.get("sql_query") or req.get("sql")
@@ -863,6 +989,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "field 'perfetto_sql' required"})
         limit = int(req.get("limit", 0) or 0)
         opts = parse_settings(req.get("settings"))
+
+        if materialized:
+            uuid = _uuid.uuid4().hex
+            name = _persist_table_name(uuid)
+            try:
+                # persist_sql only filters by trace globs (no state/max-traces).
+                resp = self.client.persist_sql(
+                    name, sql, globs=opts.get("traces") or None)
+                cols, rows = self._fetch_persisted(resp.name or name, limit, 0)
+            except TpdError as e:
+                return self._send_json(400, {"detail": str(e)})
+            self.execs.put(make_materialized_execution(
+                uuid, sql, resp.name or name, resp.num_rows))
+            return self._send_json(200, {
+                "queryUuid": uuid,
+                "columnNames": cols,
+                "rows": [{"values": r} for r in rows],
+            })
+
         try:
             columns, rows, errors = execute_bigtrace_query(
                 self.client, sql, limit, opts)
